@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+bin_dir="${HYPERPLANET_BIN_DIR:-${HOME}/.local/bin}"
+config_dir="${HYPERPLANET_CONFIG_DIR:-${XDG_CONFIG_HOME:-${HOME}/.config}/hyperplanet-stream}"
+agent="${HYPERPLANET_TERMINAL_AGENT:-hai}"
+
+start_session() {
+    local name="$1"
+    shift
+    if ! tmux has-session -t "$name" 2>/dev/null; then
+        tmux new-session -d -s "$name" "$*"
+    fi
+}
+
+start_session hyperplanet-director-indicator "${bin_dir}/hyperplanet-director-indicator ${agent}"
+start_session hyperplanet-stream "${bin_dir}/hyperplanet-stream-supervisor"
+start_session hyperplanet-watchdog "${bin_dir}/hyperplanet-stream-watchdog"
+
+if [[ -r "${config_dir}/chat-listener.json" ]]; then
+    start_session hyperplanet-chat-listener "${bin_dir}/hyperplanet-youtube-listener-supervisor"
+fi
+
+printf 'Hyperplanet services are running.\n'

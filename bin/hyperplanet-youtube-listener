@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+"""Relay one enrolled YouTube moderator's live-chat messages to HAI."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import signal
+import stat
+import subprocess
+import time
+from collections import deque
+from datetime import UTC, datetime
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+import pytchat
+
+
+CONFIG_DIR = Path(os.environ.get(
+    "HYPERPLANET_CONFIG_DIR",
+    Path.home() / ".config" / "hyperplanet-stream",
+))
+CONFIG_FILE = CONFIG_DIR / "chat-listener.json"
+WATCHDOG_CONFIG_FILE = CONFIG_DIR / "stream-watchdog.json"
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "headless-obs"
+STATE_FILE = STATE_DIR / "youtube-chat-listener.json"
+MAX_SEEN_IDS = 2000
+MAX_MESSAGE_BYTES = 4096
+stop_requested = False
+
+
+def log(message: str) -> None:
+    print(f"{datetime.now(UTC).isoformat()} {message}", flush=True)
+
+
+def stop(_signum: int, _frame: object) -> None:
+    global stop_requested
+    stop_requested = True
+
+
+def load_json(path: Path) -> dict:
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError(f"expected a JSON object: {path}")
+    return value
+
+
+def load_config() -> dict:
+    config = load_json(CONFIG_FILE)
+    trusted = config.get("trustedModerator", {})
+    channel_id = trusted.get("channelId")
+    handle = trusted.get("handleAtEnrollment")
+    target = config.get("directorTarget")
+    polling = config.get("polling", {})
+    if config.get("schemaVersion") != 1:
+        raise ValueError("unsupported listener config schema")
+    if not isinstance(channel_id, str) or not channel_id.startswith("UC") or len(channel_id) != 24:
+        raise ValueError("trusted moderator channelId is malformed")
+    if not isinstance(handle, str) or not handle.startswith("@"):
+        raise ValueError("trusted moderator enrollment handle is malformed")
+    if not isinstance(target, str) or not target:
+        raise ValueError("directorTarget is missing")
+    minimum = polling.get("minimumIntervalMillis")
+    maximum = polling.get("maximumIntervalMillis")
+    if not isinstance(minimum, int) or not isinstance(maximum, int) or not (1000 <= minimum <= maximum <= 60000):
+        raise ValueError("polling bounds are invalid")
+    return config
+
+
+def configured_video_id() -> str:
+    config = load_json(WATCHDOG_CONFIG_FILE)
+    watch_url = config.get("watchUrl")
+    if not isinstance(watch_url, str):
+        raise ValueError("stream watchdog watchUrl is missing")
+    parsed = urlparse(watch_url)
+    if parsed.scheme != "https" or parsed.hostname not in {"youtube.com", "www.youtube.com"}:
+        raise ValueError("stream watchdog watchUrl is not an HTTPS YouTube URL")
+    values = parse_qs(parsed.query).get("v", [])
+    if len(values) != 1 or not re.fullmatch(r"[A-Za-z0-9_-]{11}", values[0]):
+        raise ValueError("stream watchdog watchUrl has no canonical video ID")
+    return values[0]
+
+
+def load_state() -> dict:
+    if not STATE_FILE.exists():
+        return {"schemaVersion": 1, "chatId": None, "pageToken": None, "seenIds": []}
+    state = load_json(STATE_FILE)
+    if state.get("schemaVersion") != 1 or not isinstance(state.get("seenIds"), list):
+        raise ValueError("listener state is malformed")
+    return state
+
+
+def save_state(state: dict) -> None:
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temporary = STATE_FILE.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(state, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    os.replace(temporary, STATE_FILE)
+
+
+def authorized_text(item: object, trusted_channel_id: str) -> tuple[str | None, str]:
+    message_id = getattr(item, "id", None)
+    author = getattr(item, "author", None)
+    if not isinstance(message_id, str) or not message_id:
+        return None, "missing-message-id"
+    if getattr(item, "type", None) != "textMessage":
+        return None, "not-text"
+    if getattr(author, "channelId", None) != trusted_channel_id:
+        return None, "author-channel-mismatch"
+    if getattr(author, "isChatModerator", None) is not True:
+        return None, "not-current-moderator"
+    text = getattr(item, "message", None)
+    if not isinstance(text, str) or not text.strip():
+        return None, "empty-message"
+    if len(text.encode("utf-8")) > MAX_MESSAGE_BYTES:
+        return None, "message-too-large"
+    if any(ord(character) < 32 and character not in "\n\t" for character in text):
+        return None, "control-character"
+    return text, "authorized"
+
+
+def deliver(target: str, text: str) -> None:
+    sent = subprocess.run(
+        ["director", "send", "--raw", target, text],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    if sent.returncode != 0:
+        raise RuntimeError(f"Director send failed: {sent.stderr.strip()}")
+    time.sleep(0.35)
+    captured = subprocess.run(
+        ["director", "capture", target, "--tail", "60"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    verification_text = text.strip()[-200:]
+    if captured.returncode != 0 or verification_text not in captured.stdout:
+        log("Director dispatch succeeded but capture verification was inconclusive")
+
+
+def poll_once(chat: object, config: dict, state: dict, started_at_ms: int) -> int:
+    seen = deque(state.get("seenIds", []), maxlen=MAX_SEEN_IDS)
+    seen_set = set(seen)
+    items = list(chat.get().sync_items())
+
+    for item in items:
+        message_id = getattr(item, "id", None)
+        if not isinstance(message_id, str) or message_id in seen_set:
+            continue
+        timestamp = getattr(item, "timestamp", None)
+        if not isinstance(timestamp, int) or timestamp < started_at_ms - 5000:
+            seen.append(message_id)
+            seen_set.add(message_id)
+            continue
+        text, reason = authorized_text(item, config["trustedModerator"]["channelId"])
+        if text is not None:
+            # Persist before dispatch. A delivery failure is intentionally at-most-once:
+            # chat instructions must never loop or consume the agent context repeatedly.
+            seen.append(message_id)
+            seen_set.add(message_id)
+            state.update({"transport": "public-live-chat", "seenIds": list(seen)})
+            save_state(state)
+            deliver(config["directorTarget"], text)
+            log(f"relayed authorized message {message_id}")
+        else:
+            log(f"ignored message {message_id}: {reason}")
+            seen.append(message_id)
+            seen_set.add(message_id)
+            state.update({"transport": "public-live-chat", "seenIds": list(seen)})
+            save_state(state)
+
+    state.update({"transport": "public-live-chat", "seenIds": list(seen)})
+    save_state(state)
+    configured = config["polling"]
+    return configured["minimumIntervalMillis"]
+
+
+def run(once: bool) -> None:
+    config = load_config()
+    video_id = configured_video_id()
+    state = load_state()
+    chat = pytchat.create(video_id=video_id, interruptable=False)
+    started_at_ms = int(time.time() * 1000)
+    log(
+        "listener enrolled immutable channel "
+        f"{config['trustedModerator']['channelId']} -> {config['directorTarget']} "
+        "via public live chat"
+    )
+    try:
+        while not stop_requested:
+            if not chat.is_alive():
+                raise RuntimeError("public live chat transport stopped")
+            interval = poll_once(chat, config, state, started_at_ms)
+            state = load_state()
+            if once:
+                return
+            time.sleep(interval / 1000)
+    finally:
+        chat.terminate()
+
+
+def main() -> None:
+    os.umask(0o077)
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--once", action="store_true")
+    args = parser.parse_args()
+    run(args.once)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "trustedModerator": {
+    "handleAtEnrollment": "@your-moderator",
+    "channelId": "UC0000000000000000000000"
+  },
+  "directorTarget": "hai",
+  "polling": {
+    "minimumIntervalMillis": 2000,
+    "maximumIntervalMillis": 15000
+  }
+}

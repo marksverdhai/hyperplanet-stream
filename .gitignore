@@ -1,0 +1,43 @@
+# Credentials and local configuration
+secrets.env
+token.json
+client_secret.json
+auth-state.json
+chat-listener.json
+stream-watchdog.json
+.env
+.secrets
+
+# Media and generated output are deliberately not part of this repository
+*.aac
+*.flac
+*.gif
+*.jpeg
+*.jpg
+*.m4a
+*.mkv
+*.mov
+*.mp3
+*.mp4
+*.ogg
+*.png
+*.wav
+*.webm
+*.webp
+*.rgba
+*.flv
+*.ffconcat
+
+# Runtime state
+*.log
+*.pid
+*.tmp
+*.jsonl
+__pycache__/
+.pytest_cache/
+.venv/
+venv/
+cache/
+state/
+media/
+stream/

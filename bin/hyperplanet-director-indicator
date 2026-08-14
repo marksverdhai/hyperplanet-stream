@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+target="${1:-hai}"
+label="${HYPERPLANET_AGENT_LABEL:-${target^^}}"
+state_dir="${XDG_STATE_HOME:-${HOME}/.local/state}/headless-obs"
+output="${HYPERPLANET_DIRECTOR_STATUS_FILE:-${state_dir}/director-status.txt}"
+interval="${HYPERPLANET_DIRECTOR_POLL_SECONDS:-2}"
+
+mkdir -p -- "$state_dir"
+chmod 700 -- "$state_dir"
+
+last_text=""
+while true; do
+    status="$({ env -u LD_PRELOAD director list --tsv 2>/dev/null || true; } | awk -F '\t' -v target="$target" '$3 == target { print $8; exit }')"
+    case "$status" in
+        working) text="${label} // WORKING" ;;
+        waiting) text="${label} // WAITING" ;;
+        idle) text="${label} // LISTENING" ;;
+        rate-limited) text="${label} // RATE LIMITED" ;;
+        *) text="${label} // OFFLINE" ;;
+    esac
+
+    if [[ "$text" != "$last_text" || ! -f "$output" ]]; then
+        temporary="$(mktemp "${output}.XXXXXX")"
+        printf '%s\n' "$text" >"$temporary"
+        chmod 600 -- "$temporary"
+        mv -f -- "$temporary" "$output"
+        last_text="$text"
+    fi
+    sleep "$interval"
+done

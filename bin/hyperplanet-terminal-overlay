@@ -1,0 +1,274 @@
+#!/usr/bin/env python3
+"""Render the active Clanker tmux pane as a transparent truecolor RGBA stream."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, replace
+
+from PIL import Image, ImageDraw, ImageFont
+
+
+TARGET = os.environ.get("HYPERPLANET_TERMINAL_AGENT", "hai")
+LABEL = os.environ.get("HYPERPLANET_AGENT_LABEL", TARGET.upper())
+FONT_PATH = os.environ.get(
+    "HYPERPLANET_MONO_FONT", "/usr/share/fonts/TTF/DejaVuSansMono.ttf"
+)
+BOLD_FONT_PATH = os.environ.get(
+    "HYPERPLANET_MONO_BOLD_FONT", "/usr/share/fonts/TTF/DejaVuSansMono-Bold.ttf"
+)
+ACTIVE_SCREEN = re.compile(
+    r"(?im)^\s*(?:[\u2022*]\s*)?(?:Working|Analyzing|Searching|Thinking)(?:\s|\()"
+)
+SECRET_PATTERNS = (
+    re.compile(r"(?i)(YT_STREAM(?:_?KEY)?\s*[=:]\s*)\S+"),
+    re.compile(r"(?i)((?:access|refresh|id)_token\s*[=:]\s*)\S+"),
+    re.compile(r"(?i)(Authorization\s*:\s*(?:Bearer\s+)?)\S+"),
+    re.compile(r"(?i)([?&]code=)[^&\s]+"),
+    re.compile(r"(?i)(live2/)\S+"),
+    re.compile(r"(?i)(gh[pousr]_)[A-Za-z0-9_]+"),
+    re.compile(r"(AIza)[A-Za-z0-9_-]+"),
+    re.compile(r"(ya29\.)[A-Za-z0-9_-]+"),
+    re.compile(r"(AKIA)[A-Z0-9]{16}"),
+)
+
+DEFAULT_FG = (211, 239, 244)
+PALETTE = (
+    (22, 28, 34), (218, 82, 82), (88, 196, 126), (220, 185, 84),
+    (91, 150, 225), (186, 108, 208), (71, 201, 215), (208, 216, 220),
+    (96, 109, 119), (255, 116, 116), (130, 224, 158), (247, 216, 117),
+    (130, 183, 244), (218, 151, 232), (132, 230, 240), (244, 249, 250),
+)
+
+
+@dataclass(frozen=True)
+class Cell:
+    char: str = " "
+    fg: tuple[int, int, int] = DEFAULT_FG
+    bg: tuple[int, int, int] | None = None
+    bold: bool = False
+
+
+def director_row() -> tuple[str, str] | None:
+    result = subprocess.run(
+        ["director", "list", "--tsv"],
+        text=True,
+        errors="replace",
+        capture_output=True,
+        env={key: value for key, value in os.environ.items() if key != "LD_PRELOAD"},
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        fields = line.split("\t")
+        if len(fields) >= 8 and fields[2] == TARGET and fields[3].casefold() == "clanker":
+            return fields[0], fields[7]
+    return None
+
+
+def capture_pane(pane_id: str) -> str:
+    result = subprocess.run(
+        ["tmux", "capture-pane", "-p", "-e", "-t", pane_id],
+        text=True,
+        errors="replace",
+        capture_output=True,
+        check=False,
+    )
+    return result.stdout if result.returncode == 0 else ""
+
+
+def indexed_color(index: int) -> tuple[int, int, int]:
+    if index < 16:
+        return PALETTE[index]
+    if index < 232:
+        value = index - 16
+        levels = (0, 95, 135, 175, 215, 255)
+        return levels[value // 36], levels[(value // 6) % 6], levels[value % 6]
+    grey = 8 + (index - 232) * 10
+    return grey, grey, grey
+
+
+def apply_sgr(parameters: list[int], cell: Cell) -> Cell:
+    if not parameters:
+        parameters = [0]
+    index = 0
+    while index < len(parameters):
+        code = parameters[index]
+        if code == 0:
+            cell = Cell()
+        elif code == 1:
+            cell = replace(cell, bold=True)
+        elif code == 22:
+            cell = replace(cell, bold=False)
+        elif code == 39:
+            cell = replace(cell, fg=DEFAULT_FG)
+        elif code == 49:
+            cell = replace(cell, bg=None)
+        elif 30 <= code <= 37:
+            cell = replace(cell, fg=PALETTE[code - 30])
+        elif 90 <= code <= 97:
+            cell = replace(cell, fg=PALETTE[8 + code - 90])
+        elif 40 <= code <= 47:
+            cell = replace(cell, bg=PALETTE[code - 40])
+        elif 100 <= code <= 107:
+            cell = replace(cell, bg=PALETTE[8 + code - 100])
+        elif code in (38, 48) and index + 1 < len(parameters):
+            target = "fg" if code == 38 else "bg"
+            mode = parameters[index + 1]
+            if mode == 2 and index + 4 < len(parameters):
+                color = tuple(max(0, min(255, value)) for value in parameters[index + 2:index + 5])
+                cell = replace(cell, **{target: color})
+                index += 4
+            elif mode == 5 and index + 2 < len(parameters):
+                cell = replace(cell, **{target: indexed_color(parameters[index + 2])})
+                index += 2
+        index += 1
+    return cell
+
+
+def parse_ansi(value: str) -> list[list[Cell]]:
+    rows: list[list[Cell]] = [[]]
+    style = Cell()
+    index = 0
+    while index < len(value):
+        char = value[index]
+        if char == "\x1b" and index + 1 < len(value) and value[index + 1] == "[":
+            end = index + 2
+            while end < len(value) and not ("@" <= value[end] <= "~"):
+                end += 1
+            if end < len(value):
+                if value[end] == "m":
+                    raw = value[index + 2:end]
+                    try:
+                        parameters = [int(item or "0") for item in raw.split(";")]
+                    except ValueError:
+                        parameters = []
+                    style = apply_sgr(parameters, style)
+                index = end + 1
+                continue
+        if char == "\n":
+            rows.append([])
+        elif char == "\t":
+            rows[-1].extend(replace(style, char=" ") for _ in range(4))
+        elif ord(char) >= 32:
+            rows[-1].append(replace(style, char=char))
+        index += 1
+    return rows
+
+
+def redact_rows(rows: list[list[Cell]]) -> None:
+    for row in rows:
+        plain = "".join(cell.char for cell in row)
+        for pattern in SECRET_PATTERNS:
+            for match in reversed(list(pattern.finditer(plain))):
+                prefix = match.group(1)
+                replacement = prefix + "[REDACTED]"
+                style = row[match.start()] if match.start() < len(row) else Cell()
+                cells = [replace(style, char=char, bg=None) for char in replacement]
+                row[match.start():match.end()] = cells
+                plain = "".join(cell.char for cell in row)
+
+
+def render_frame(width: int, height: int, max_columns: int, max_rows: int) -> bytes:
+    image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    row = director_row()
+    if row is None:
+        return image.tobytes()
+    pane_id, status = row
+    raw = capture_pane(pane_id)
+    plain = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", raw)
+    if status not in {"working", "waiting"} and ACTIVE_SCREEN.search(plain) is None:
+        return image.tobytes()
+
+    rows = parse_ansi(raw)
+    redact_rows(rows)
+    while rows and not rows[-1]:
+        rows.pop()
+    rows = rows[-max_rows:]
+
+    draw = ImageDraw.Draw(image, "RGBA")
+    font = ImageFont.truetype(FONT_PATH, 16)
+    bold_font = ImageFont.truetype(BOLD_FONT_PATH, 16)
+    cell_width = 10
+    cell_height = 20
+    left = 18
+    top = 47
+    panel_right = min(width - 1, left * 2 + max_columns * cell_width)
+    panel_bottom = min(height - 1, top + max_rows * cell_height + 16)
+    draw.rounded_rectangle(
+        (0, 0, panel_right, panel_bottom), radius=5,
+        fill=(3, 13, 20, 148), outline=(116, 220, 234, 120), width=1,
+    )
+    draw.rectangle((18, 33, 160, 35), fill=(150, 236, 246, 220))
+    draw.text(
+        (18, 10), f"{LABEL} // CLANKER TERMINAL", font=bold_font,
+        fill=(211, 248, 252, 245),
+    )
+
+    for row_index, cells in enumerate(rows):
+        y = top + row_index * cell_height
+        for column, cell in enumerate(cells[:max_columns]):
+            x = left + column * cell_width
+            if cell.bg is not None:
+                draw.rectangle(
+                    (x, y, x + cell_width - 1, y + cell_height - 1),
+                    fill=(*cell.bg, 236),
+                )
+            if cell.char == " ":
+                continue
+            color = (*cell.fg, 255)
+            if cell.char == "█":
+                draw.rectangle((x, y, x + cell_width - 1, y + cell_height - 1), fill=color)
+            elif cell.char == "▀":
+                draw.rectangle((x, y, x + cell_width - 1, y + cell_height // 2 - 1), fill=color)
+            elif cell.char == "▄":
+                draw.rectangle((x, y + cell_height // 2, x + cell_width - 1, y + cell_height - 1), fill=color)
+            elif cell.char == "▌":
+                draw.rectangle((x, y, x + cell_width // 2 - 1, y + cell_height - 1), fill=color)
+            elif cell.char == "▐":
+                draw.rectangle((x + cell_width // 2, y, x + cell_width - 1, y + cell_height - 1), fill=color)
+            else:
+                draw.text((x, y - 1), cell.char, font=bold_font if cell.bold else font, fill=color)
+    return image.tobytes()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--width", type=int, default=1000)
+    parser.add_argument("--height", type=int, default=620)
+    parser.add_argument("--fps", type=int, default=12)
+    parser.add_argument("--columns", type=int, default=96)
+    parser.add_argument("--rows", type=int, default=27)
+    parser.add_argument("--once", action="store_true")
+    args = parser.parse_args()
+    if not (320 <= args.width <= 1400 and 240 <= args.height <= 900 and 1 <= args.fps <= 30):
+        raise SystemExit("terminal renderer dimensions or frame rate are outside the supported range")
+
+    output = sys.stdout.buffer
+    next_capture = 0.0
+    next_frame = time.monotonic()
+    frame = bytes(args.width * args.height * 4)
+    while True:
+        now = time.monotonic()
+        if now >= next_capture:
+            frame = render_frame(args.width, args.height, args.columns, args.rows)
+            next_capture = now + 1.0
+        try:
+            output.write(frame)
+            output.flush()
+        except BrokenPipeError:
+            return
+        if args.once:
+            return
+        next_frame += 1.0 / args.fps
+        time.sleep(max(0.0, next_frame - time.monotonic()))
+
+
+if __name__ == "__main__":
+    main()

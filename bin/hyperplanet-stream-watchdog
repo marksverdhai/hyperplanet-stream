@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""Guard the Hyperplanet encoder and public YouTube live state."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import signal
+import subprocess
+import time
+from datetime import UTC, datetime
+from pathlib import Path
+from urllib.request import Request, urlopen
+
+
+CONFIG = Path(os.environ.get(
+    "HYPERPLANET_WATCHDOG_CONFIG",
+    Path.home() / ".config/hyperplanet-stream/stream-watchdog.json",
+))
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "headless-obs"
+PROGRESS = STATE_DIR / "encoder-progress.txt"
+STATUS = STATE_DIR / "stream-watchdog-status.json"
+LOG = STATE_DIR / "stream-watchdog.log"
+stop_requested = False
+
+
+def log(message: str) -> None:
+    line = f"{datetime.now(UTC).isoformat()} {message}"
+    print(line, flush=True)
+    with LOG.open("a", encoding="utf-8") as handle:
+        handle.write(line + "\n")
+
+
+def stop(_signal: int, _frame: object) -> None:
+    global stop_requested
+    stop_requested = True
+
+
+def tmux_running() -> bool:
+    return subprocess.run(
+        ["tmux", "has-session", "-t", "hyperplanet-stream"],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    ).returncode == 0
+
+
+def restart_stream() -> None:
+    subprocess.run(
+        ["tmux", "kill-session", "-t", "hyperplanet-stream"],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    command = str(Path(os.environ.get(
+        "HYPERPLANET_BIN_DIR", Path.home() / ".local/bin"
+    )) / "hyperplanet-stream-supervisor")
+    subprocess.run(
+        ["tmux", "new-session", "-d", "-s", "hyperplanet-stream", command],
+        check=True,
+    )
+    log("encoder restarted")
+
+
+def encoder_health(max_age: int, minimum_speed: float) -> tuple[bool, str]:
+    if not tmux_running():
+        return False, "tmux-session-missing"
+    if not PROGRESS.is_file():
+        return False, "encoder-progress-missing"
+    age = time.time() - PROGRESS.stat().st_mtime
+    if age > max_age:
+        return False, f"encoder-progress-stale:{age:.1f}s"
+    values: dict[str, str] = {}
+    for line in PROGRESS.read_text(encoding="utf-8", errors="replace").splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            values[key] = value
+    raw_speed = values.get("speed", "0x").removesuffix("x")
+    try:
+        speed = float(raw_speed)
+    except ValueError:
+        speed = 0.0
+    if speed < minimum_speed:
+        return False, f"encoder-speed-low:{speed:.3f}x"
+    return True, f"encoder-ok:{speed:.3f}x"
+
+
+def public_live(url: str) -> tuple[bool, str]:
+    request = Request(url, headers={"User-Agent": "Mozilla/5.0 HyperplanetWatchdog/1"})
+    with urlopen(request, timeout=15) as response:
+        body = response.read(4 * 1024 * 1024).decode("utf-8", errors="replace")
+    match = re.search(r'"liveBroadcastDetails":\{"isLiveNow":(true|false)', body)
+    if not match:
+        return False, "public-live-state-missing"
+    live = match.group(1) == "true"
+    return live, "public-live" if live else "public-not-live"
+
+
+def save_status(encoder: str, public: str, failures: int) -> None:
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temporary = STATUS.with_suffix(".json.tmp")
+    temporary.write_text(
+        json.dumps(
+            {
+                "schemaVersion": 1,
+                "checkedAt": datetime.now(UTC).isoformat(),
+                "encoder": encoder,
+                "public": public,
+                "consecutiveEncoderFailures": failures,
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, STATUS)
+
+
+def main() -> None:
+    os.umask(0o077)
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    config = json.loads(CONFIG.read_text(encoding="utf-8"))
+    failures = 0
+    last_public = None
+    last_encoder = None
+    while not stop_requested:
+        try:
+            live, public = public_live(config["watchUrl"])
+        except Exception as error:
+            live, public = False, f"public-check-error:{type(error).__name__}"
+        if public != last_public:
+            log(public)
+            last_public = public
+        healthy, encoder = encoder_health(
+            config["encoderHeartbeatMaxAgeSeconds"], config["minimumEncoderSpeed"]
+        )
+        if healthy:
+            failures = 0
+        else:
+            failures += 1
+            if encoder != last_encoder:
+                log(encoder)
+            # Do not hammer an ingest key after YouTube has finalized the event.
+            # A manually started/new live event or an existing encoder is restartable.
+            if failures >= config["failuresBeforeRestart"] and (live or tmux_running()):
+                restart_stream()
+                failures = 0
+        last_encoder = encoder
+        save_status(encoder, public, failures)
+        time.sleep(config["checkIntervalSeconds"])
+
+
+if __name__ == "__main__":
+    main()

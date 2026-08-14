@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "shuffleScenes": true,
+  "defaultAudio": {
+    "musicGain": 0.66
+  },
+  "scenes": [
+    {
+      "id": "loop-one",
+      "displayName": "Loop One",
+      "video": "one/loop-one.mp4"
+    },
+    {
+      "id": "planet",
+      "displayName": "Spatial Planet",
+      "video": "three/planet.mp4",
+      "audioProfile": "profiles/planet.json"
+    },
+    {
+      "id": "mercury-office",
+      "displayName": "Mercury Office",
+      "video": "three/mercury-office.mp4",
+      "audioProfile": "profiles/mercury-office.json"
+    }
+  ]
+}

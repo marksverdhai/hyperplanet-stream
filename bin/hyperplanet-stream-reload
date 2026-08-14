@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""Preflight a Hyperplanet visual change, then perform a health-checked handoff."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import selectors
+import shlex
+import signal
+import socket
+import subprocess
+import time
+from pathlib import Path
+
+
+HOME = Path.home()
+BIN_DIR = Path(os.environ.get("HYPERPLANET_BIN_DIR", HOME / ".local/bin"))
+STREAM = BIN_DIR / "hyperplanet-youtube-stream"
+SUPERVISOR = BIN_DIR / "hyperplanet-stream-supervisor"
+VIBE = Path(os.environ.get("HYPERPLANET_VIBE_BINARY", HOME / ".cargo/bin/vibe-headless"))
+SHADER_ROOT = Path(os.environ.get(
+    "HYPERPLANET_SHADER_ROOT",
+    HOME / ".local/share/hyperplanet-stream/shaders",
+)).resolve()
+PROGRESS = HOME / ".local/state/headless-obs/encoder-progress.txt"
+
+
+def validate_shader(value: str) -> Path:
+    path = Path(value).expanduser().resolve(strict=True)
+    if not path.is_file() or path.parent != SHADER_ROOT or path.suffix != ".wgsl":
+        raise SystemExit("shader must be an ordinary WGSL file in the HT Vibe shader directory")
+    return path
+
+
+def current_vibe() -> tuple[str, int, int] | None:
+    for entry in Path("/proc").glob("[0-9]*/cmdline"):
+        try:
+            parts = [part.decode() for part in entry.read_bytes().split(b"\0") if part]
+        except (OSError, UnicodeDecodeError):
+            continue
+        if not parts or not parts[0].endswith("vibe-headless"):
+            continue
+        try:
+            return (
+                parts[parts.index("--shader") + 1],
+                int(parts[parts.index("--width") + 1]),
+                int(parts[parts.index("--height") + 1]),
+            )
+        except (ValueError, IndexError):
+            continue
+    return None
+
+
+def current_audio() -> Path:
+    for entry in Path("/proc").glob("[0-9]*/cmdline"):
+        try:
+            parts = [part.decode() for part in entry.read_bytes().split(b"\0") if part]
+        except (OSError, UnicodeDecodeError):
+            continue
+        if parts and parts[0].endswith("vibe-headless") and "--audio" in parts:
+            path = Path(parts[parts.index("--audio") + 1])
+            if path.is_file():
+                return path
+    candidates = sorted(
+        (HOME / ".cache/hyperplanet-stream/audio").glob("*.wav"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    if not candidates:
+        raise SystemExit("no prepared stream audio is available for shader preflight")
+    return candidates[0]
+
+
+def wait_for_ingest_dns(timeout: float = 30.0) -> None:
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            socket.getaddrinfo("a.rtmps.youtube.com", 443, type=socket.SOCK_STREAM)
+            return
+        except socket.gaierror:
+            if time.monotonic() >= deadline:
+                raise SystemExit("YouTube ingest DNS is unavailable; live encoder was not touched")
+            time.sleep(2)
+
+
+def preflight_shader(shader: Path, width: int, height: int) -> None:
+    audio = current_audio()
+    process = subprocess.Popen(
+        [
+            str(VIBE), "--audio", str(audio), "--shader", str(shader),
+            "--width", str(width), "--height", str(height), "--fps", "24",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    assert process.stdout is not None
+    os.set_blocking(process.stdout.fileno(), False)
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    required = width * height * 4
+    received = 0
+    deadline = time.monotonic() + 20
+    try:
+        while received < required and time.monotonic() < deadline:
+            for key, _ in selector.select(timeout=0.5):
+                chunk = os.read(key.fd, min(1024 * 1024, required - received))
+                if not chunk:
+                    break
+                received += len(chunk)
+            if process.poll() is not None and received < required:
+                break
+        if received < required:
+            error = process.stderr.read().decode(errors="replace")[-2000:] if process.stderr else ""
+            raise SystemExit(f"shader preflight produced {received}/{required} frame bytes: {error}")
+    finally:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+
+
+def supervisor_command(shader: str, width: int, height: int) -> str:
+    return shlex.join(
+        [
+            "env",
+            f"HYPERPLANET_VIBE_SHADER={shader}",
+            f"HYPERPLANET_VIBE_WIDTH={width}",
+            f"HYPERPLANET_VIBE_HEIGHT={height}",
+            str(SUPERVISOR),
+        ]
+    )
+
+
+def handoff(shader: Path, width: int, height: int) -> None:
+    previous = current_vibe()
+    started = time.time()
+    panes = subprocess.run(
+        ["tmux", "list-panes", "-t", "hyperplanet-stream", "-F", "#{pane_id}"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    command = supervisor_command(str(shader), width, height)
+    if panes.returncode == 0 and panes.stdout.strip():
+        subprocess.run(["tmux", "respawn-pane", "-k", "-t", panes.stdout.splitlines()[0], command], check=True)
+    else:
+        subprocess.run(["tmux", "new-session", "-d", "-s", "hyperplanet-stream", command], check=True)
+
+    deadline = time.monotonic() + 50
+    reason = "no fresh encoder progress"
+    while time.monotonic() < deadline:
+        time.sleep(2)
+        active = current_vibe()
+        if active != (str(shader), width, height):
+            reason = "candidate renderer is not active"
+            continue
+        if not PROGRESS.is_file() or PROGRESS.stat().st_mtime < started:
+            continue
+        values = {}
+        for line in PROGRESS.read_text(errors="replace").splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                values[key] = value.strip()
+        try:
+            speed = float(values.get("speed", "0x").removesuffix("x"))
+            dropped = int(values.get("drop_frames", "1"))
+        except ValueError:
+            continue
+        if speed >= 0.9 and dropped == 0:
+            return
+        reason = f"candidate encoder unhealthy: speed={speed:.3f}, dropped={dropped}"
+
+    if previous is not None:
+        rollback = supervisor_command(*previous)
+        pane = subprocess.check_output(
+            ["tmux", "list-panes", "-t", "hyperplanet-stream", "-F", "#{pane_id}"], text=True
+        ).splitlines()[0]
+        subprocess.run(["tmux", "respawn-pane", "-k", "-t", pane, rollback], check=True)
+    raise SystemExit(f"stream handoff failed and previous visual was restored: {reason}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("shader")
+    parser.add_argument("--width", type=int, default=640)
+    parser.add_argument("--height", type=int, default=360)
+    args = parser.parse_args()
+    if not (320 <= args.width <= 1920 and 180 <= args.height <= 1080):
+        raise SystemExit("render dimensions are outside the supported range")
+    shader = validate_shader(args.shader)
+    subprocess.run(["bash", "-n", str(STREAM)], check=True)
+    subprocess.run(["bash", "-n", str(SUPERVISOR)], check=True)
+    preflight_shader(shader, args.width, args.height)
+    wait_for_ingest_dns()
+    handoff(shader, args.width, args.height)
+    print(json.dumps({"ok": True, "shader": str(shader), "width": args.width, "height": args.height}))
+
+
+if __name__ == "__main__":
+    main()

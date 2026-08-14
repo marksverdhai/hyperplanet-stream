@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "id": "mercury-office",
+  "music": {
+    "gain": 0.33,
+    "spatialTransform": {
+      "position": "front-right-above",
+      "azimuthDegrees": 15,
+      "elevationDegrees": 35,
+      "nearEarGain": 0.68,
+      "farEarGain": 0.56,
+      "nearEarLowpassHz": 14500,
+      "farEarLowpassHz": 12000,
+      "farEarDelaySamples": 5,
+      "speakerHighpassHz": 90,
+      "speakerPresenceHz": 1800,
+      "speakerPresenceGainDb": 1.5,
+      "roomLowpassHz": 12000,
+      "reflectionDelaysMs": [24, 52],
+      "reflectionDecays": [0.07, 0.03]
+    }
+  },
+  "sfx": [{
+    "path": "sfx/space-turbulence.mp3",
+    "gain": 0.5016,
+    "loop": true
+  }]
+}

@@ -1,0 +1,266 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+config_dir="${HYPERPLANET_CONFIG_DIR:-${XDG_CONFIG_HOME:-${HOME}/.config}/hyperplanet-stream}"
+stream_root="${HYPERPLANET_STREAM_ROOT:-${HOME}/stream}"
+bin_dir="${HYPERPLANET_BIN_DIR:-${HOME}/.local/bin}"
+data_dir="${XDG_DATA_HOME:-${HOME}/.local/share}/hyperplanet-stream"
+secrets_file="${HYPERPLANET_SECRETS_FILE:-${config_dir}/secrets.env}"
+catalog_file="${HYPERPLANET_SCENE_CATALOG:-${stream_root}/scenes/catalog.json}"
+playlist_root="${HYPERPLANET_PLAYLIST_ROOT:-${stream_root}/playlists}"
+sfx_file="${HYPERPLANET_SFX_FILE:-${stream_root}/sfx/space-turbulence.mp3}"
+vibe_binary="${HYPERPLANET_VIBE_BINARY:-${HOME}/.cargo/bin/vibe-headless}"
+vibe_shader="${HYPERPLANET_VIBE_SHADER:-${data_dir}/shaders/hai_mandelbulb.wgsl}"
+terminal_renderer="${bin_dir}/hyperplanet-terminal-overlay"
+font_mono="${HYPERPLANET_MONO_FONT:-/usr/share/fonts/TTF/DejaVuSansMono.ttf}"
+font_title="${HYPERPLANET_TITLE_FONT:-/usr/share/fonts/TTF/DejaVuSansCondensed-Bold.ttf}"
+state_dir="${XDG_STATE_HOME:-${HOME}/.local/state}/headless-obs"
+director_status_file="${state_dir}/director-status.txt"
+cache_dir="${XDG_CACHE_HOME:-${HOME}/.cache}/hyperplanet-stream/audio"
+width=1920
+height=1080
+render_width="${HYPERPLANET_VIBE_WIDTH:-640}"
+render_height="${HYPERPLANET_VIBE_HEIGHT:-360}"
+terminal_width=1000
+terminal_height=620
+terminal_fps=12
+fps=24
+video_bitrate=10000
+audio_bitrate=256
+stream_label="${HYPERPLANET_STREAM_LABEL:-LIVE ROTATION}"
+planet_scene_id="${HYPERPLANET_PLANET_SCENE_ID:-planet}"
+mercury_scene_id="${HYPERPLANET_MERCURY_SCENE_ID:-mercury-office}"
+
+[[ "$stream_label" =~ ^[A-Za-z0-9_[:space:]-]+$ ]] || {
+    echo "stream label contains unsupported characters" >&2
+    exit 1
+}
+
+for prerequisite in "$secrets_file" "$catalog_file" "$sfx_file" "$vibe_binary" \
+    "$vibe_shader" "$terminal_renderer" "$font_mono" "$font_title"; do
+    if [[ ! -r "$prerequisite" ]]; then
+        echo "stream prerequisite is missing: $prerequisite" >&2
+        exit 1
+    fi
+done
+[[ -x "$vibe_binary" ]] || { echo "vibe-headless is not executable" >&2; exit 1; }
+[[ -x "$terminal_renderer" ]] || { echo "terminal renderer is not executable" >&2; exit 1; }
+
+if ! jq -e '
+    .schemaVersion == 1 and
+    (.shuffleScenes | type == "boolean") and
+    (.defaultAudio.musicGain | type == "number" and . >= 0 and . <= 1) and
+    (.scenes | type == "array" and length > 0) and
+    all(.scenes[];
+      (.id | type == "string" and test("^[a-z0-9-]+$")) and
+      (.displayName | type == "string" and length > 0) and
+      (.video | type == "string" and length > 0) and
+      ((.audioProfile // "") | type == "string"))
+  ' "$catalog_file" >/dev/null; then
+    echo "invalid scene catalog: $catalog_file" >&2
+    exit 1
+fi
+default_music_gain="$(jq -r '.defaultAudio.musicGain' "$catalog_file")"
+
+set -a
+# shellcheck source=/dev/null
+source "$secrets_file"
+set +a
+stream_key="${YT_STREAMKEY:-${YT_STREAM_KEY:-}}"
+[[ -n "$stream_key" ]] || { echo "YouTube stream key is missing" >&2; exit 1; }
+
+umask 077
+mkdir -p "$state_dir" "$cache_dir"
+samples_per_frame=$((48000 / fps))
+catalog_dir="$(dirname "$(realpath -e "$catalog_file")")"
+stream_root_real="$(realpath -e "$stream_root")"
+
+resolve_stream_asset() {
+    local base="$1"
+    local configured="$2"
+    local resolved
+    resolved="$(realpath -e "${base}/${configured}")"
+    case "$resolved" in
+        "${stream_root_real}/"*) printf '%s\n' "$resolved" ;;
+        *) echo "asset escapes stream root: $configured" >&2; return 1 ;;
+    esac
+}
+
+# Build a shuffled, frame-accurate scene cycle.
+mapfile -t scene_rows < <(jq -cr '.scenes[]' "$catalog_file")
+if jq -e '.shuffleScenes' "$catalog_file" >/dev/null; then
+    mapfile -d '' scene_rows < <(printf '%s\0' "${scene_rows[@]}" | shuf -z)
+fi
+scene_concat="${state_dir}/all-scenes.ffconcat"
+temporary_scenes="$(mktemp "${state_dir}/.all-scenes.XXXXXX")"
+printf 'ffconcat version 1.0\n' >"$temporary_scenes"
+declare -a scene_ids scene_names scene_paths scene_starts scene_ends scene_title_files
+scene_cursor=0
+planet_condition="0"
+mercury_condition="0"
+
+for scene_index in "${!scene_rows[@]}"; do
+    row="${scene_rows[$scene_index]}"
+    id="$(jq -r '.id' <<<"$row")"
+    name="$(jq -r '.displayName' <<<"$row")"
+    video="$(resolve_stream_asset "$catalog_dir" "$(jq -r '.video' <<<"$row")")"
+    duration="$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$video")"
+    frames="$(awk -v duration="$duration" -v fps="$fps" 'BEGIN { printf "%d", duration * fps + 0.5 }')"
+    (( frames > 0 )) || { echo "invalid scene duration: $video" >&2; exit 1; }
+    scene_ids[$scene_index]="$id"
+    scene_names[$scene_index]="$name"
+    scene_paths[$scene_index]="$video"
+    scene_starts[$scene_index]="$scene_cursor"
+    scene_cursor=$((scene_cursor + frames))
+    scene_ends[$scene_index]=$((scene_cursor - 1))
+    title_file="${state_dir}/scene-${scene_index}.txt"
+    printf '%s\n' "$name" >"$title_file"
+    scene_title_files[$scene_index]="$title_file"
+    [[ "$video" != *"'"* && "$video" != *$'\n'* ]] || exit 1
+    printf "file '%s'\nduration %.9f\n" "$video" "$(awk -v f="$frames" -v fps="$fps" 'BEGIN { print f/fps }')" >>"$temporary_scenes"
+done
+mv -f -- "$temporary_scenes" "$scene_concat"
+scene_cycle_frames="$scene_cursor"
+scene_cycle_seconds="$(awk -v frames="$scene_cycle_frames" -v fps="$fps" 'BEGIN { printf "%.9f", frames/fps }')"
+
+for scene_index in "${!scene_ids[@]}"; do
+    start_seconds="$(awk -v f="${scene_starts[$scene_index]}" -v fps="$fps" 'BEGIN { printf "%.9f", f/fps }')"
+    end_seconds="$(awk -v f="${scene_ends[$scene_index]}" -v fps="$fps" 'BEGIN { printf "%.9f", (f+1)/fps }')"
+    condition="between(mod(t\\,${scene_cycle_seconds})\\,${start_seconds}\\,${end_seconds})"
+    if [[ "${scene_ids[$scene_index]}" == "$planet_scene_id" ]]; then
+        planet_condition="$condition"
+    elif [[ "${scene_ids[$scene_index]}" == "$mercury_scene_id" ]]; then
+        mercury_condition="$condition"
+    fi
+done
+profile_condition="max(${planet_condition}\\,${mercury_condition})"
+default_condition="1-${profile_condition}"
+
+# Normalize every track from every playlist and shuffle one continuous cycle.
+mapfile -d '' source_tracks < <(
+    find "$playlist_root" -mindepth 2 -maxdepth 2 -type f \
+        \( -iname '*.wav' -o -iname '*.mp3' -o -iname '*.flac' \
+        -o -iname '*.m4a' -o -iname '*.aac' -o -iname '*.ogg' \) \
+        -print0 | sort -z
+)
+(( ${#source_tracks[@]} > 0 )) || { echo "no playlist audio found" >&2; exit 1; }
+mapfile -d '' shuffled_tracks < <(printf '%s\0' "${source_tracks[@]}" | shuf -z)
+
+track_concat="${state_dir}/all-playlists.ffconcat"
+temporary_tracks="$(mktemp "${state_dir}/.all-playlists.XXXXXX")"
+printf 'ffconcat version 1.0\n' >"$temporary_tracks"
+declare -a track_starts track_ends track_title_files normalized_tracks
+track_cursor=0
+
+for track_index in "${!shuffled_tracks[@]}"; do
+    source_track="${shuffled_tracks[$track_index]}"
+    source_hash="$(sha256sum "$source_track" | cut -d ' ' -f 1)"
+    normalized="${cache_dir}/${source_hash}-${fps}fps.wav"
+    if [[ ! -r "$normalized" ]]; then
+        temporary="$(mktemp "${cache_dir}/.${source_hash}.XXXXXX")"
+        ffmpeg -hide_banner -loglevel error -y -i "$source_track" \
+            -vn -c:a pcm_s16le -ar 48000 -ac 2 -f wav "$temporary"
+        samples="$(ffprobe -v error -select_streams a:0 -show_entries stream=duration_ts -of default=nw=1:nk=1 "$temporary")"
+        padding=$(( (samples_per_frame - samples % samples_per_frame) % samples_per_frame ))
+        if (( padding > 0 )); then
+            padded="$(mktemp "${cache_dir}/.${source_hash}.padded.XXXXXX")"
+            ffmpeg -hide_banner -loglevel error -y -i "$temporary" \
+                -af "apad=pad_len=${padding}" -c:a pcm_s16le -ar 48000 -ac 2 -f wav "$padded"
+            command rm -- "$temporary"
+            mv -f -- "$padded" "$normalized"
+        else
+            mv -f -- "$temporary" "$normalized"
+        fi
+    fi
+    samples="$(ffprobe -v error -select_streams a:0 -show_entries stream=duration_ts -of default=nw=1:nk=1 "$normalized")"
+    (( samples > 0 && samples % samples_per_frame == 0 )) || exit 1
+    frames=$((samples / samples_per_frame))
+    track_starts[$track_index]="$track_cursor"
+    track_cursor=$((track_cursor + frames))
+    track_ends[$track_index]=$((track_cursor - 1))
+    title_file="${state_dir}/track-${track_index}.txt"
+    printf '%s\n' "$(basename "$source_track")" >"$title_file"
+    track_title_files[$track_index]="$title_file"
+    normalized_tracks[$track_index]="$normalized"
+    printf "file '%s'\n" "$normalized" >>"$temporary_tracks"
+done
+mv -f -- "$temporary_tracks" "$track_concat"
+track_cycle_frames="$track_cursor"
+cycle_hash="$(printf '%s\0' "${normalized_tracks[@]}" | sha256sum | cut -d ' ' -f 1)"
+music_cycle="${cache_dir}/all-playlists-${cycle_hash}.wav"
+if [[ ! -r "$music_cycle" ]]; then
+    temporary_cycle="$(mktemp "${cache_dir}/.${cycle_hash}.XXXXXX")"
+    ffmpeg -hide_banner -loglevel error -y -f concat -safe 0 -i "$track_concat" \
+        -c:a copy -f wav "$temporary_cycle"
+    mv -f -- "$temporary_cycle" "$music_cycle"
+fi
+
+filter_graph="[1:v]fps=${fps},setpts=PTS-STARTPTS,scale=${width}:${height}:flags=lanczos,format=rgba,
+drawtext=fontfile='${font_mono}':text='VISUAL SOURCE //':x=80:y=h-116:fontsize=22:fontcolor=0x9caab1:borderw=1:bordercolor=black@0.92:shadowcolor=black@0.9:shadowx=3:shadowy=3[scene_hud]"
+scene_label="scene_hud"
+for scene_index in "${!scene_ids[@]}"; do
+    next_label="scene_title_${scene_index}"
+    start_seconds="$(awk -v f="${scene_starts[$scene_index]}" -v fps="$fps" 'BEGIN { printf "%.9f", f/fps }')"
+    end_seconds="$(awk -v f="${scene_ends[$scene_index]}" -v fps="$fps" 'BEGIN { printf "%.9f", (f+1)/fps }')"
+    enable="between(mod(t\\,${scene_cycle_seconds})\\,${start_seconds}\\,${end_seconds})"
+    filter_graph+=";[${scene_label}]drawtext=fontfile='${font_mono}':textfile='${scene_title_files[$scene_index]}':x=301:y=h-116:fontsize=22:fontcolor=0xa9efff:borderw=1:bordercolor=black@0.92:shadowcolor=black@0.9:shadowx=3:shadowy=3:enable='${enable}'[${next_label}]"
+    scene_label="$next_label"
+done
+
+track_cycle_seconds="$(awk -v frames="$track_cycle_frames" -v fps="$fps" 'BEGIN { printf "%.9f", frames/fps }')"
+filter_graph+=";
+[0:v]setpts=PTS-STARTPTS,scale=${width}:${height}:flags=lanczos,format=rgba,
+drawbox=x=80:y=h-260:w=70:h=3:color=0xb7f4ff@0.98:t=fill,
+drawbox=x=160:y=h-260:w=138:h=3:color=0x718791@0.82:t=fill,
+drawtext=fontfile='${font_mono}':text='${stream_label}':x=80:y=h-238:fontsize=24:fontcolor=0xa9efff:borderw=1:bordercolor=0x101820@0.95:shadowcolor=black@0.9:shadowx=3:shadowy=3[track_hud]"
+track_label="track_hud"
+for track_index in "${!shuffled_tracks[@]}"; do
+    next_label="track_title_${track_index}"
+    start_seconds="$(awk -v f="${track_starts[$track_index]}" -v fps="$fps" 'BEGIN { printf "%.9f", f/fps }')"
+    end_seconds="$(awk -v f="${track_ends[$track_index]}" -v fps="$fps" 'BEGIN { printf "%.9f", (f+1)/fps }')"
+    enable="between(mod(t\\,${track_cycle_seconds})\\,${start_seconds}\\,${end_seconds})"
+    filter_graph+=";[${track_label}]drawtext=fontfile='${font_title}':textfile='${track_title_files[$track_index]}':x=78:y=h-198:fontsize=56:fontcolor=0xf1fbff:borderw=1:bordercolor=0x8cdfee@0.92:shadowcolor=0x284958@0.9:shadowx=3:shadowy=4:enable='${enable}'[${next_label}]"
+    track_label="$next_label"
+done
+
+filter_graph+=";[${scene_label}][${track_label}]overlay=shortest=1:format=auto[composited];
+[4:v]setpts=PTS-STARTPTS,format=rgba[terminal_rgba];
+[composited][terminal_rgba]overlay=x=52:y=92:shortest=0:eof_action=pass:repeatlast=1:format=auto[terminal_overlay];
+[terminal_overlay]drawtext=fontfile='${font_mono}':textfile='${director_status_file}':reload=48:x=72:y=58:fontsize=24:fontcolor=0xc8f7ff:borderw=1:bordercolor=0x17232a@0.95:shadowcolor=black@0.9:shadowx=3:shadowy=3,format=yuv420p[vout];
+[2:a]aresample=48000,asplit=3[music_default_src][music_planet_src][music_mercury_src];
+[music_default_src]volume='if(${default_condition}\\,${default_music_gain}\\,0)':eval=frame[music_default];
+[music_planet_src]pan=mono|c0=0.5*c0+0.5*c1,volume='if(${planet_condition}\\,0.33\\,0)':eval=frame,asplit=3[planet_near_src][planet_far_src][planet_room_src];
+[planet_near_src]lowpass=f=2800:p=2,pan=stereo|FL=0*c0|FR=0.72*c0[planet_near];
+[planet_far_src]lowpass=f=2400:p=2,adelay=8S,pan=stereo|FL=0.58*c0|FR=0*c0[planet_far];
+[planet_room_src]lowpass=f=1100:p=2,aecho=0.70:0.25:55|110:0.10|0.06,pan=stereo|FL=0.50*c0|FR=0.50*c0[planet_room];
+[planet_near][planet_far][planet_room]amix=inputs=3:normalize=0[music_planet];
+[music_mercury_src]pan=mono|c0=0.5*c0+0.5*c1,volume='if(${mercury_condition}\\,0.33\\,0)':eval=frame,highpass=f=90:p=2,equalizer=f=1800:t=q:w=0.8:g=1.5,asplit=3[mercury_near_src][mercury_far_src][mercury_room_src];
+[mercury_near_src]lowpass=f=14500:p=2,pan=stereo|FL=0*c0|FR=0.68*c0[mercury_near];
+[mercury_far_src]lowpass=f=12000:p=2,adelay=5S,pan=stereo|FL=0.56*c0|FR=0*c0[mercury_far];
+[mercury_room_src]lowpass=f=12000:p=2,aecho=0.70:0.25:24|52:0.07|0.03,pan=stereo|FL=0.50*c0|FR=0.50*c0[mercury_room];
+[mercury_near][mercury_far][mercury_room]amix=inputs=3:normalize=0[music_mercury];
+[3:a]aresample=48000,asplit=2[sfx_planet_src][sfx_mercury_src];
+[sfx_planet_src]volume='if(${planet_condition}\\,0.76\\,0)':eval=frame,stereowiden=delay=12:feedback=0.08:crossfeed=0.18:drymix=0.95[sfx_planet];
+[sfx_mercury_src]volume='if(${mercury_condition}\\,0.5016\\,0)':eval=frame,stereowiden=delay=12:feedback=0.08:crossfeed=0.18:drymix=0.95[sfx_mercury];
+[music_default][music_planet][music_mercury][sfx_planet][sfx_mercury]amix=inputs=5:duration=longest:dropout_transition=0:normalize=0,alimiter=limit=0.92:attack=5:release=50[aout]"
+
+exec ffmpeg -hide_banner -loglevel warning -nostats \
+    -re -f rawvideo -pixel_format rgba -video_size "${render_width}x${render_height}" -framerate "$fps" \
+    -i <("$vibe_binary" --audio "$music_cycle" --shader "$vibe_shader" \
+        --width "$render_width" --height "$render_height" --fps "$fps") \
+    -thread_queue_size 512 -stream_loop -1 -f concat -safe 0 -i "$scene_concat" \
+    -thread_queue_size 512 -stream_loop -1 -i "$music_cycle" \
+    -thread_queue_size 512 -stream_loop -1 -i "$sfx_file" \
+    -thread_queue_size 64 -f rawvideo -pixel_format rgba \
+    -video_size "${terminal_width}x${terminal_height}" -framerate "$terminal_fps" \
+    -i <("$terminal_renderer" --width "$terminal_width" --height "$terminal_height" \
+        --fps "$terminal_fps") \
+    -filter_complex "$filter_graph" -map '[vout]' -map '[aout]' \
+    -c:v libx264 -preset superfast -tune zerolatency -profile:v high -level:v 4.1 \
+    -pix_fmt yuv420p -r "$fps" -g 48 -keyint_min 48 -sc_threshold 0 \
+    -b:v "${video_bitrate}k" -minrate "${video_bitrate}k" -maxrate "${video_bitrate}k" \
+    -bufsize "$((video_bitrate * 2))k" -x264-params 'nal-hrd=cbr:force-cfr=1' \
+    -c:a aac -b:a "${audio_bitrate}k" -ar 48000 -ac 2 \
+    -progress "${state_dir}/encoder-progress.txt" -stats_period 5 \
+    -flvflags no_duration_filesize -f flv \
+    "rtmps://a.rtmps.youtube.com:443/live2/${stream_key}"

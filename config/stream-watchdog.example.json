@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "watchUrl": "https://www.youtube.com/watch?v=00000000000",
+  "checkIntervalSeconds": 30,
+  "encoderHeartbeatMaxAgeSeconds": 25,
+  "minimumEncoderSpeed": 0.9,
+  "failuresBeforeRestart": 2
+}

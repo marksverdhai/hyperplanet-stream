@@ -1,0 +1,4 @@
+google-api-python-client>=2.170,<3
+google-auth-oauthlib>=1.2,<2
+Pillow>=12,<13
+pytchat==0.5.5

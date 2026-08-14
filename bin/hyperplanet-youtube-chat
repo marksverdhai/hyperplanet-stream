@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""Authenticate and interact with the active Hyperplanet YouTube live chat."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+
+
+CONFIG_DIR = Path(os.environ.get(
+    "HYPERPLANET_CONFIG_DIR",
+    Path.home() / ".config" / "hyperplanet-stream",
+))
+CLIENT_FILE = CONFIG_DIR / "client_secret.json"
+TOKEN_FILE = CONFIG_DIR / "token.json"
+AUTH_STATE_FILE = CONFIG_DIR / "auth-state.json"
+REDIRECT_URI = "http://localhost:8765/"
+SCOPES = ["https://www.googleapis.com/auth/youtube.force-ssl"]
+
+
+def save_token(credentials: Credentials) -> None:
+    CONFIG_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    TOKEN_FILE.write_text(credentials.to_json(), encoding="utf-8")
+    TOKEN_FILE.chmod(stat.S_IRUSR | stat.S_IWUSR)
+
+
+def credentials(interactive: bool = False) -> Credentials:
+    creds = None
+    if TOKEN_FILE.exists():
+        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+    if creds and creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+        save_token(creds)
+    if creds and creds.valid:
+        return creds
+    if not interactive:
+        raise SystemExit(f"OAuth is not initialized; run: {sys.argv[0]} auth")
+    if not CLIENT_FILE.is_file():
+        raise SystemExit(f"Desktop OAuth client JSON is missing: {CLIENT_FILE}")
+    flow = InstalledAppFlow.from_client_secrets_file(CLIENT_FILE, SCOPES)
+    creds = flow.run_local_server(
+        host="127.0.0.1",
+        port=8765,
+        open_browser=False,
+        authorization_prompt_message="Open this URL in your browser:\n{url}",
+        success_message="YouTube OAuth complete. You may close this browser tab.",
+    )
+    save_token(creds)
+    return creds
+
+
+def youtube(interactive: bool = False):
+    return build("youtube", "v3", credentials=credentials(interactive), cache_discovery=False)
+
+
+def active_chat_id(api) -> str:
+    response = api.liveBroadcasts().list(
+        part="snippet,status",
+        broadcastStatus="active",
+        maxResults=10,
+    ).execute()
+    items = response.get("items", [])
+    if not items:
+        raise SystemExit("No active authenticated-channel broadcast found")
+    chat_id = items[0].get("snippet", {}).get("liveChatId")
+    if not chat_id:
+        raise SystemExit("The active broadcast has no live chat")
+    return chat_id
+
+
+def cmd_auth(_: argparse.Namespace) -> None:
+    api = youtube(interactive=True)
+    response = api.channels().list(part="snippet", mine=True).execute()
+    items = response.get("items", [])
+    if not items:
+        raise SystemExit("OAuth account has no YouTube channel")
+    print(json.dumps({"ok": True, "channel": items[0]["snippet"]["title"]}))
+
+
+def cmd_auth_start(_: argparse.Namespace) -> None:
+    if not CLIENT_FILE.is_file():
+        raise SystemExit(f"Desktop OAuth client JSON is missing: {CLIENT_FILE}")
+    flow = InstalledAppFlow.from_client_secrets_file(
+        CLIENT_FILE, SCOPES, redirect_uri=REDIRECT_URI
+    )
+    url, state = flow.authorization_url(access_type="offline", prompt="consent")
+    AUTH_STATE_FILE.write_text(
+        json.dumps({"state": state, "code_verifier": flow.code_verifier}),
+        encoding="utf-8",
+    )
+    AUTH_STATE_FILE.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    print(url)
+
+
+def cmd_auth_finish(_: argparse.Namespace) -> None:
+    if not AUTH_STATE_FILE.is_file():
+        raise SystemExit("No pending OAuth flow; run auth-start first")
+    pending = json.loads(AUTH_STATE_FILE.read_text(encoding="utf-8"))
+    state = pending["state"]
+    code_verifier = pending.get("code_verifier")
+    if not code_verifier:
+        raise SystemExit("Pending OAuth flow lacks its PKCE verifier; run auth-start again")
+    flow = InstalledAppFlow.from_client_secrets_file(
+        CLIENT_FILE, SCOPES, state=state, redirect_uri=REDIRECT_URI
+    )
+    print("Paste the complete failed localhost redirect URL, then press Enter:", file=sys.stderr)
+    redirect = sys.stdin.readline().strip()
+    if not redirect.startswith(REDIRECT_URI):
+        raise SystemExit(f"Expected a redirect beginning with {REDIRECT_URI}")
+    query = parse_qs(urlparse(redirect).query)
+    if query.get("state", [None])[0] != state:
+        raise SystemExit("OAuth redirect state does not match the pending flow")
+    code = query.get("code", [None])[0]
+    if not code:
+        raise SystemExit("OAuth redirect contains no authorization code")
+    flow.code_verifier = code_verifier
+    flow.fetch_token(code=code)
+    save_token(flow.credentials)
+    AUTH_STATE_FILE.unlink()
+    response = youtube().channels().list(part="snippet", mine=True).execute()
+    items = response.get("items", [])
+    if not items:
+        raise SystemExit("OAuth account has no YouTube channel")
+    print(json.dumps({"ok": True, "channel": items[0]["snippet"]["title"]}))
+
+
+def cmd_list(args: argparse.Namespace) -> None:
+    api = youtube()
+    response = api.liveChatMessages().list(
+        liveChatId=active_chat_id(api),
+        part="id,snippet,authorDetails",
+        maxResults=args.limit,
+    ).execute()
+    rows = []
+    for item in response.get("items", []):
+        rows.append(
+            {
+                "id": item["id"],
+                "publishedAt": item["snippet"]["publishedAt"],
+                "author": item["authorDetails"]["displayName"],
+                "message": item["snippet"].get("displayMessage", ""),
+            }
+        )
+    print(json.dumps(rows, ensure_ascii=True, indent=2))
+
+
+def cmd_send(args: argparse.Namespace) -> None:
+    api = youtube()
+    response = api.liveChatMessages().insert(
+        part="snippet",
+        body={
+            "snippet": {
+                "liveChatId": active_chat_id(api),
+                "type": "textMessageEvent",
+                "textMessageDetails": {"messageText": args.message},
+            }
+        },
+    ).execute()
+    print(json.dumps({"ok": True, "id": response["id"]}))
+
+
+def main() -> None:
+    os.umask(0o077)
+    parser = argparse.ArgumentParser()
+    commands = parser.add_subparsers(dest="command", required=True)
+    auth = commands.add_parser("auth")
+    auth.set_defaults(func=cmd_auth)
+    auth_start = commands.add_parser("auth-start")
+    auth_start.set_defaults(func=cmd_auth_start)
+    auth_finish = commands.add_parser("auth-finish")
+    auth_finish.set_defaults(func=cmd_auth_finish)
+    listing = commands.add_parser("list")
+    listing.add_argument("--limit", type=int, default=20, choices=range(1, 201))
+    listing.set_defaults(func=cmd_list)
+    send = commands.add_parser("send")
+    send.add_argument("message")
+    send.set_defaults(func=cmd_send)
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

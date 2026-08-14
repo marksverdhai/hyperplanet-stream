@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -u
+
+log="${XDG_STATE_HOME:-${HOME}/.local/state}/headless-obs/stream.log"
+bin_dir="${HYPERPLANET_BIN_DIR:-${HOME}/.local/bin}"
+mkdir -p -- "$(dirname -- "$log")"
+
+while true; do
+    status=0
+    "${bin_dir}/hyperplanet-youtube-stream" 2>&1 | tee -a "$log" || status=$?
+    printf 'stream attempt exited with status %s; starting a fresh process in 5 seconds\n' "$status" | tee -a "$log" >&2
+    sleep 5
+done

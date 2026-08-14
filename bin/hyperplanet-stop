@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+for session in \
+    hyperplanet-chat-listener \
+    hyperplanet-watchdog \
+    hyperplanet-stream \
+    hyperplanet-director-indicator; do
+    tmux kill-session -t "$session" 2>/dev/null || true
+done
+
+printf 'Hyperplanet services are stopped.\n'

@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -u -o pipefail
+
+python="${HYPERPLANET_LISTENER_PYTHON:-${HOME}/.local/share/hyperplanet-stream/venv/bin/python}"
+listener="${HYPERPLANET_BIN_DIR:-${HOME}/.local/bin}/hyperplanet-youtube-listener"
+log="${XDG_STATE_HOME:-${HOME}/.local/state}/headless-obs/youtube-chat-listener.log"
+
+[[ -x "$python" ]] || { echo "listener virtual environment is missing" >&2; exit 1; }
+[[ -x "$listener" ]] || { echo "listener executable is missing" >&2; exit 1; }
+mkdir -p -- "$(dirname -- "$log")"
+
+while true; do
+    status=0
+    "$python" -u "$listener" 2>&1 | tee -a "$log" || status=${PIPESTATUS[0]}
+    printf 'listener exited with status %s; restarting in 5 seconds\n' "$status" | tee -a "$log"
+    sleep 5
+done

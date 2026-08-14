@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "planet",
+  "music": {
+    "gain": 0.33,
+    "spatialTransform": {
+      "position": "front-right-far",
+      "azimuthDegrees": 15,
+      "nearEarGain": 0.72,
+      "farEarGain": 0.58,
+      "nearEarLowpassHz": 2800,
+      "farEarLowpassHz": 2400,
+      "farEarDelaySamples": 8,
+      "roomLowpassHz": 1100,
+      "reflectionDelaysMs": [55, 110],
+      "reflectionDecays": [0.10, 0.06]
+    }
+  },
+  "sfx": [{
+    "path": "sfx/space-turbulence.mp3",
+    "gain": 0.76,
+    "loop": true
+  }]
+}
