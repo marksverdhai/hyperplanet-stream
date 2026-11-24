@@ -5,6 +5,10 @@
     "channelId": "UC0000000000000000000000"
   },
   "directorTarget": "hai",
+  "acknowledgement": {
+    "enabled": true,
+    "message": "HAI received your message."
+  },
   "polling": {
     "minimumIntervalMillis": 2000,
     "maximumIntervalMillis": 15000

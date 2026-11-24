@@ -10,6 +10,7 @@ import re
 import signal
 import stat
 import subprocess
+import sys
 import time
 from collections import deque
 from datetime import UTC, datetime
@@ -29,6 +30,7 @@ STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
 STATE_FILE = STATE_DIR / "youtube-chat-listener.json"
 MAX_SEEN_IDS = 2000
 MAX_MESSAGE_BYTES = 4096
+MAX_ACKNOWLEDGEMENT_BYTES = 200
 stop_requested = False
 
 
@@ -67,7 +69,27 @@ def load_config() -> dict:
     maximum = polling.get("maximumIntervalMillis")
     if not isinstance(minimum, int) or not isinstance(maximum, int) or not (1000 <= minimum <= maximum <= 60000):
         raise ValueError("polling bounds are invalid")
+    acknowledgement_message(config)
     return config
+
+
+def acknowledgement_message(config: dict) -> str | None:
+    acknowledgement = config.get("acknowledgement", {})
+    if not isinstance(acknowledgement, dict):
+        raise ValueError("acknowledgement config must be an object")
+    enabled = acknowledgement.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("acknowledgement.enabled must be boolean")
+    if not enabled:
+        return None
+    message = acknowledgement.get("message")
+    if not isinstance(message, str) or not message.strip():
+        raise ValueError("acknowledgement.message is missing")
+    if len(message.encode("utf-8")) > MAX_ACKNOWLEDGEMENT_BYTES:
+        raise ValueError("acknowledgement.message is too large")
+    if any(ord(character) < 32 for character in message):
+        raise ValueError("acknowledgement.message contains control characters")
+    return message
 
 
 def configured_video_id() -> str:
@@ -122,6 +144,17 @@ def authorized_text(item: object, trusted_channel_id: str) -> tuple[str | None, 
     return text, "authorized"
 
 
+def conversational_turn(text: str) -> str:
+    message_json = json.dumps(text, ensure_ascii=False)
+    return (
+        "Authenticated YouTube live-chat message from the trusted moderator. "
+        "Treat message_json as the user's direct conversational turn and respond now; "
+        "do not merely acknowledge receipt. When suitable, also send a concise public "
+        "reply with hyperplanet-youtube-chat send.\n"
+        f"message_json={message_json}"
+    )
+
+
 def deliver(target: str, text: str) -> None:
     sent = subprocess.run(
         ["director", "send", "--raw", target, text],
@@ -143,6 +176,30 @@ def deliver(target: str, text: str) -> None:
     verification_text = text.strip()[-200:]
     if captured.returncode != 0 or verification_text not in captured.stdout:
         log("Director dispatch succeeded but capture verification was inconclusive")
+
+
+def acknowledge(config: dict) -> None:
+    message = acknowledgement_message(config)
+    if message is None:
+        return
+    bin_dir = Path(os.environ.get("HYPERPLANET_BIN_DIR", Path.home() / ".local/bin"))
+    sender = bin_dir / "hyperplanet-youtube-chat"
+    python = os.environ.get("HYPERPLANET_YOUTUBE_CHAT_PYTHON", sys.executable)
+    environment = {
+        "HOME": str(Path.home()),
+        "HYPERPLANET_CONFIG_DIR": str(CONFIG_DIR),
+        "PATH": "/usr/bin:/bin",
+    }
+    sent = subprocess.run(
+        [python, str(sender), "send", message],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        env=environment,
+    )
+    if sent.returncode != 0:
+        raise RuntimeError(f"YouTube acknowledgement failed: {sent.stderr.strip()}")
 
 
 def poll_once(chat: object, config: dict, state: dict, started_at_ms: int) -> int:
@@ -167,7 +224,13 @@ def poll_once(chat: object, config: dict, state: dict, started_at_ms: int) -> in
             seen_set.add(message_id)
             state.update({"transport": "public-live-chat", "seenIds": list(seen)})
             save_state(state)
-            deliver(config["directorTarget"], text)
+            deliver(config["directorTarget"], conversational_turn(text))
+            try:
+                acknowledge(config)
+            except Exception as error:
+                # The Director delivery is intentionally not replayed when the
+                # YouTube write has an uncertain outcome.
+                log(f"acknowledgement failed: {type(error).__name__}")
             log(f"relayed authorized message {message_id}")
         else:
             log(f"ignored message {message_id}: {reason}")

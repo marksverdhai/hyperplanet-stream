@@ -16,6 +16,8 @@ This repository contains **no media assets or credentials**. Supply video, music
 - Encoder and public-stream watchdog
 - YouTube live-chat listener pinned to an exact moderator channel ID and moderator badge
 - At-most-once Director delivery with no handle-only trust
+- Contextual chat turns that explicitly request a conversational response without exposing delivery IDs
+- Configurable YouTube acknowledgement after successful trusted-message delivery
 
 ## Requirements
 
@@ -91,7 +93,9 @@ OAuth is required only for writing to chat. Put a Google desktop OAuth client at
 hyperplanet-youtube-chat auth
 ```
 
-The incoming listener uses the public live-chat transport and therefore does not consume YouTube Data API quota. It still requires an exact channel-ID match and the current moderator badge before forwarding message text to Director.
+The incoming listener uses the public live-chat transport and therefore does not consume YouTube Data API quota. It still requires an exact channel-ID match and the current moderator badge before forwarding message text to Director. Authorized text is JSON-encoded inside a fixed, code-owned conversational prompt that asks the agent to respond and optionally mirror a concise answer into public chat; transport identifiers are kept out of the agent context.
+
+When `acknowledgement.enabled` is true, each successfully relayed trusted message receives the configured fixed reply in live chat. The listener ignores the channel's own reply, and an uncertain YouTube write is never retried.
 
 ## Security
 
